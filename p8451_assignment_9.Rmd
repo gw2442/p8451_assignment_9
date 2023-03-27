@@ -1,0 +1,260 @@
+---
+title: "p8451_assignment_9"
+output: html_document
+date: "2023-03-27"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+### Loading packages and preparing dataset
+
+The code below will load the data and process it. 
+
+1. Subsetting the data to only include the relevant features
+2. Removing observations with missing values
+
+From the prior assignment, the data are imbalanced, so we will need to deal with this during our analysis.
+
+```{r data_prep}
+library(lattice)
+library(NHANES)
+library(dplyr)
+library(caret)
+library(randomForest)
+
+
+data ("NHANES")
+table(NHANES$Diabetes)
+
+keep.var<-names(NHANES) %in% c("Age", "Race1", "Education", "Poverty", "Weight", "Height", "Pulse", "Diabetes", "BMI", "PhysActive", "Smoke100", "BPSysAve", "BPDiaAve", "TotChol")
+
+NHANES.subset<-NHANES[keep.var]
+
+str(NHANES.subset)
+
+#Remove missings and then remove duplicates
+NHANES.subset<-na.omit(NHANES.subset)
+NHANES.subset<-unique(NHANES.subset)
+
+#Check distributions
+summary(NHANES.subset)
+
+```
+
+### Set up: Partition data into training/testing
+
+```{r partition}
+
+set.seed(123)
+
+training.data<-createDataPartition(NHANES.subset$Diabetes, p=0.7, list=F)
+train.data<-NHANES.subset[training.data, ]
+test.data<-NHANES.subset[-training.data, ]
+
+```
+
+Using the demonstration code from class, the analysis was repeated but  *up sampling* was used instead to try to improve model performance.
+
+### Model 1: Random Forest with 3 values of mtry and 3 values of ntree
+
+```{r}
+# Try mtry of all, half of all, sqrt of all, 
+# Try ntree of 100, 300, 500
+feat.count<-c((ncol(train.data)-1), (ncol(train.data)-1)/2, sqrt(ncol(train.data)-1))
+grid.rf<-expand.grid(mtry=feat.count)
+
+control.obj<-trainControl(method="cv", number=5, sampling="up")
+
+tree.num<-seq(100,500, by=200)
+results.trees<-list()
+for (ntree in tree.num){
+  set.seed(123)
+    rf.nhanes<-train(Diabetes~., data=train.data, method="rf", trControl=control.obj, metric="Accuracy", tuneGrid=grid.rf, importance=TRUE, ntree=ntree)
+    index<-toString(ntree)
+  results.trees[[index]]<-rf.nhanes$results
+}
+
+output.nhanes<-bind_rows(results.trees, .id = "ntrees")
+best.tune<-output.nhanes[which.max(output.nhanes[,"Accuracy"]),]
+best.tune$mtry
+results.trees
+mtry.grid<-expand.grid(.mtry=best.tune$mtry)
+
+set.seed(123)
+    rf.nhanes.bt<-train(Diabetes~., data=train.data, method="rf", trControl=control.obj, metric="Accuracy", tuneGrid=mtry.grid, importance=TRUE, ntree=as.numeric(best.tune$ntrees))
+
+confusionMatrix(rf.nhanes.bt)
+varImp(rf.nhanes.bt)
+varImpPlot(rf.nhanes.bt$finalModel)
+```
+
+### Model 2: Support Vector Classifier
+
+```{r}
+set.seed(123)
+
+control.obj<-trainControl(method="cv", number=5, sampling="up", classProbs = TRUE)
+
+#Repeat expanding the grid search
+set.seed(123)
+
+svc.nhanes<-train(Diabetes ~ ., data=train.data, method="svmLinear", trControl=control.obj, preProcess=c("center", "scale"), probability=TRUE, tuneGrid=expand.grid(C=seq(0.0001,100, length=10)))
+
+svc.nhanes$bestTune
+svc.nhanes$results
+confusionMatrix(svc.nhanes)
+```
+
+### Model 3: Logistic Regression
+```{r}
+set.seed(123)
+
+control.obj<-trainControl(method="cv", number=5, sampling="up")
+
+logit.nhanes<-train(Diabetes~., data=train.data, method="glm", family="binomial",preProcess=c("center", "scale"), trControl=control.obj)
+
+logit.nhanes$results
+confusionMatrix(logit.nhanes)
+coef(logit.nhanes$finalModel)
+
+```
+
+### Output predicted probabilities from each of the three models applied within the testing set. 
+
+```{r}
+
+#Predict in test-set and output probabilities
+rf.probs<-predict(rf.nhanes, test.data, type="prob")
+
+#Pull out predicted probabilities for Diabetes=Yes
+rf.pp<-rf.probs[,2]
+
+svc.probs<-predict(svc.nhanes,test.data, type="prob")
+svc.pp<-svc.probs[,2]
+
+#Predict in test-set using response type
+logit.probs<-predict(logit.nhanes, test.data, type="prob")
+logit.pp<-logit.probs[,2]
+```
+
+### Plot and compare calibration curves across the three algorithms. 
+
+```{r}
+pred.prob<-data.frame(Class=test.data$Diabetes, logit=logit.pp, rf=rf.pp, svc=svc.pp)
+
+calplot<-(calibration(Class ~ logit+rf+svc, data=pred.prob, class="Yes", cuts=10))
+
+xyplot(calplot, auto.key=list(columns=3))
+```
+
+### Calibrate the probabilities from SVC, RF, and Logistic Regression
+
+Partition testing data into 2 sets: set to train calibration and then set to evaluate results
+
+Method: Platt's Scaling-train a logistic regression model on the outputs of your classifier
+
+```{r}
+set.seed(123)
+cal.data.index<-test.data$Diabetes%>% createDataPartition(p=0.5, list=F)
+cal.data<-test.data[cal.data.index, ]
+final.test.data<-test.data[-cal.data.index, ]
+```
+
+#### Calibrating RF
+
+```{r}
+#Predict on test-set without scaling to obtain raw pred prob in test set
+rf.probs.nocal<-predict(rf.nhanes, final.test.data, type="prob")
+rf.pp.nocal<-rf.probs.nocal[,2]
+
+#Apply model developed on training data to calibration dataset to obtain predictions
+rf.probs.cal<-predict(rf.nhanes, cal.data, type="prob")
+rf.pp.cal<-rf.probs.cal[,2]
+
+#Add to dataset with actual values from calibration data
+calib.rf.data.frame<-data.frame(rf.pp.cal, cal.data$Diabetes)
+colnames(calib.rf.data.frame)<-c("x", "y")
+
+#Use logistic regression to model predicted probabilities from calibration data to actual vales
+calib.rf.model<-glm(y ~ x, data=calib.rf.data.frame, family = binomial)
+
+#Apply calibration model above to raw predicted probabilities from test set
+data.test.rf<-data.frame(rf.pp.nocal)
+colnames(data.test.rf)<-c("x")
+platt.data.rf<-predict(calib.rf.model, data.test.rf, type="response")
+
+platt.prob.rf<-data.frame(Class=final.test.data$Diabetes, rf.platt=platt.data.rf, rf=rf.pp.nocal)
+
+calplot.rf<-(calibration(Class ~ rf.platt+rf, data=platt.prob.rf, class="Yes", cuts=10))
+xyplot(calplot.rf, auto.key=list(columns=2))
+```
+
+#### Calibrating SVC
+
+```{r}
+#Predict on test-set without scaling
+svc.probs.nocal<-predict(svc.nhanes,final.test.data, type="prob")
+svc.pp.nocal<-svc.probs.nocal[,2]
+
+
+#Apply model developed on training data to calibration dataset to obtain predictions
+svc.probs.cal<-predict(svc.nhanes,cal.data, type="prob")
+svc.pp.cal<-svc.probs.cal[,2]
+
+#Add to dataset with actual values from calibration data
+calib.svc.data.frame<-data.frame(svc.pp.cal, cal.data$Diabetes)
+colnames(calib.svc.data.frame)<-c("x", "y")
+
+#Use logistic regression to model predicted probabilities from calibration data to actual values
+calib.svc.model<-glm(y ~ x, data=calib.svc.data.frame, family = binomial)
+
+#Apply calibration model above to raw predicted probabilities from test set
+data.test.svc<-data.frame(svc.pp.nocal)
+colnames(data.test.svc)<-c("x")
+platt.data.svc<-predict(calib.svc.model, data.test.svc, type="response")
+
+platt.prob.svc<-data.frame(Class=final.test.data$Diabetes, svc.platt=platt.data.svc, svc=svc.pp.nocal)
+
+calplot.svc<-(calibration(Class ~ svc.platt+svc, data=platt.prob.svc, class="Yes", cuts=10))
+xyplot(calplot.svc, auto.key=list(columns=2))
+```
+
+#### Calibrating Logistic Regression 
+
+```{r}
+#Predict on test-set without scaling to obtain raw pred prob in test set
+logit.probs.nocal<- predict(logit.nhanes, final.test.data, type="prob")
+logit.pp.nocal<- logit.probs.nocal[,2]
+
+#Apply model developed on training data to calibration dataset to obtain predictions
+logit.probs.cal<- predict(logit.nhanes, cal.data, type="prob")
+logit.pp.cal<- logit.probs.cal[,2]
+
+#Add to dataset with actual values from calibration data
+calib.logit.data.frame<- data.frame(logit.pp.cal, cal.data$Diabetes)
+colnames(calib.logit.data.frame)<-c("x", "y")
+
+#Use logistic regression to model predicted probabilities from calibration data to actual values 
+calib.logit.model<- glm(y ~ x, data = calib.logit.data.frame, family = binomial)
+
+#Apply calibration model above to raw predicted probabilities from test set 
+data.test.logit<- data.frame(logit.pp.nocal)
+colnames(data.test.logit)<- c("x")
+platt.data.logit<- predict(calib.logit.model, data.test.logit, type="response")
+
+platt.prob.logit<- data.frame(Class = final.test.data$Diabetes, logit.platt = platt.data.logit, logit=logit.pp.nocal)
+
+calplot.logit<-(calibration(Class ~ logit.platt+logit, data = platt.prob.logit, class = "Yes", cuts = 10))
+xyplot(calplot.logit, auto.key = list(columns = 2))
+
+```
+
+### Optimal model 
+
+Based off of the three models above showing the pre and post calibration plots for all three algorithms, it is evident that none of the final models are "optimal". An optimal model would demonstrate points along the line of the plot with a slope of 1 (i.e. the value along the x-axis (Bin Midpoint) is equal to the value along the y-axis (Observed Event Percentage)). This type of model would indicate that it was highly able to predict risk. However, the three models generated above demonstrates otherwise. The calibrated random forest model indicates that while it is good at estimating risk early on, it begins to over-estimate risk around 40% until 60% and then it demonstrates a high under-estimation of risk at 70%, then falling back down to an overestimation for the rest of the model. This would not be useful in a clinical setting. The calibrated SVC model indicates that it is quite good at estimating risk until 50%, it highly overestimates risk for the rest of the model. This is also observed in the calibrated logistic regression model. Ultimately, all of the three models would not be useful in a clinical setting, as it is only good at estimating risk for half of the model. Therefore, none of the models are "optimal". 
+
+One additional evaluation I would perform if the goal was to implement this model within a clinical setting would be to increase the number of cross validations to see if the model would improve in its ability to predict risk. Increasing the number of cross validations may improve the model, allowing it to be implemented in clincal settings.
+
+
